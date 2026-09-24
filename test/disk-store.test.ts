@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DiskStore } from '../src/disk-store.ts';
@@ -117,4 +117,56 @@ test('does not leave temp files behind after a successful write', () =>
     const [a, b] = keyToSegments(key);
     const names = await readdir(join(dir, a, b));
     assert.deepEqual(names, [`${key.slice(4)}.vec`]);
+  }));
+
+test('a zero-byte file is reported as corrupt and then removed', () =>
+  withTempDir(async (dir) => {
+    const store = new DiskStore(dir);
+    const key = embedKey('m', 'hello');
+    const [a, b, file] = keyToSegments(key);
+    await mkdir(join(dir, a, b), { recursive: true });
+    await writeFile(join(dir, a, b, file), Buffer.alloc(0));
+
+    const result = await store.get(key);
+    assert.equal(result.vector, null);
+    assert.equal(result.corrupt, true);
+    assert.equal((await store.get(key)).corrupt, false); // gone after the first read
+  }));
+
+test('a leftover temp file from an interrupted write is ignored', () =>
+  withTempDir(async (dir) => {
+    const store = new DiskStore(dir);
+    const key = embedKey('m', 'hello');
+    await store.set(key, [1, 2, 3]);
+
+    const [a, b] = keyToSegments(key);
+    const shard = join(dir, a, b);
+    await writeFile(join(shard, `.${key}.deadbeef.tmp`), Buffer.alloc(4));
+
+    const result = await store.get(key);
+    assert.deepEqual(result.vector, Float32Array.from([1, 2, 3]));
+    assert.equal(result.corrupt, false);
+  }));
+
+test('two keys sharing a shard directory do not collide', () =>
+  withTempDir(async (dir) => {
+    const store = new DiskStore(dir);
+    // synthetic keys, chosen only to share their first four hex characters
+    // so both land in the same shard directory.
+    const keyA = '0'.repeat(64);
+    const keyB = `0000${'f'.repeat(60)}`;
+    await store.set(keyA, [1, 2]);
+    await store.set(keyB, [3, 4, 5]);
+    assert.deepEqual((await store.get(keyA)).vector, Float32Array.from([1, 2]));
+    assert.deepEqual((await store.get(keyB)).vector, Float32Array.from([3, 4, 5]));
+  }));
+
+test('an explicit null expectedDim skips the dim check', () =>
+  withTempDir(async (dir) => {
+    const store = new DiskStore(dir);
+    const key = embedKey('m', 'hello');
+    await store.set(key, [1, 2, 3]);
+    const result = await store.get(key, null);
+    assert.deepEqual(result.vector, Float32Array.from([1, 2, 3]));
+    assert.equal(result.corrupt, false);
   }));
